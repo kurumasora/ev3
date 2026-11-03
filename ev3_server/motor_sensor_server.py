@@ -18,7 +18,7 @@ import time
 
 from pybricks.hubs import EV3Brick
 from pybricks.ev3devices import Motor, UltrasonicSensor, GyroSensor
-from pybricks.parameters import Port, Stop, Direction
+from pybricks.parameters import Port, Direction
 
 ev3 = EV3Brick()
 
@@ -54,7 +54,7 @@ conn.settimeout(1.0)         # do not wait forever for a command
 
 def stop_all():
     for m in motors:
-        m.stop(Stop.BRAKE)
+        m.brake()
 
 
 try:

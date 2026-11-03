@@ -55,16 +55,17 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
   - 実行：`cd raspi_client && uv run python <ファイル名>`
   - 追加：`uv add <パッケージ>`．`pip install` は使わない．
 - 主なファイル
-  - `camera.py`：モデル読み込み・前処理・推論（`load_model`, `preprocess_image`, `predict_digit`）
-  - `raspi_client.py`：TCPクライアント本体．カメラ → 推論 → EV3へ速度指令を送信．
-  - `realtime_recognition.py`：EV3なしで認識だけを試すツール（`--web` でブラウザ配信）
+  - `camera.py`：カメラからのフレーム取得と認識エリアの計算（`LatestFrameReader`, `center_roi`）
+  - `digit_recognizer.py`：モデル読み込み・前処理・推論（`load_model`, `preprocess_image`, `predict_digit`）
+  - `robot_controller.py`：TCPクライアント本体．カメラ → 推論 → EV3へ速度指令を送信．
+  - `recognition_viewer.py`：EV3なしで認識だけを試すツール（`--web` でブラウザ配信）
 - 学習済みモデル `mnist_model.keras` が存在しない場合は，勝手に再学習せず，ユーザに確認する．
 - MNIST程度の学習はRaspberry Pi上で行ってよい．ただし学習の実行前にはユーザに確認する（実行中は推論・カメラ処理が重くなるため）．
 
 ## EV3側（`ev3_server/`）
 
 - 主なファイル
-  - `ev3_main_copy.py`：TCPサーバ本体（ポート9999）
+  - `motor_sensor_server.py`：TCPサーバ本体（ポート9999）
 - 実行環境は **pybricks-micropython**（ev3dev上）．ev3dev2ライブラリではない．
   - 先頭行：`#!/usr/bin/env pybricks-micropython`
   - API：`pybricks.hubs`, `pybricks.ev3devices`, `pybricks.parameters`, `pybricks.tools`
@@ -73,7 +74,7 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
   - 標準ライブラリは限定的．使えるか不明なモジュールは使わない．
   - `time.sleep` より `pybricks.tools.wait`（ミリ秒）を優先する．
 - ソケットを使う場合は `SO_REUSEADDR` を設定する（強制終了後の「使用中」エラー対策）．
-- 通信が途絶えたら必ずモータを停止する処理を入れる（`finally` で `motor.stop()`）．
+- 通信が途絶えたら必ずモータを停止する処理を入れる（`finally` で `motor.brake()`）．
 
 ## EV3への転送と実行
 
@@ -85,8 +86,8 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 - パスワードをファイルやコマンドに書かない．
 - コマンド（`2_5j/` で実行．ファイル名と時間は必要に応じて変える）：
   ```
-  scp ev3_server/ev3_main_copy.py robot@10.42.0.175:~/
-  ssh -t robot@10.42.0.175 'timeout 120 brickrun -r -- pybricks-micropython ev3_main_copy.py'
+  scp ev3_server/motor_sensor_server.py robot@10.42.0.175:~/
+  ssh -t robot@10.42.0.175 'timeout 120 brickrun -r -- pybricks-micropython motor_sensor_server.py'
   ```
 - 起動順はEV3（サーバ）が先，Raspberry Pi（クライアント）が後．
 - EV3は非常に低速．SSH接続やpybricksの起動に数秒〜十数秒かかるのは正常．すぐにリトライしない．

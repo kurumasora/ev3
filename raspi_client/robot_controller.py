@@ -15,8 +15,8 @@ EV3がセンサ値を1行送るたびに，Piが速度指令を1行返す．EV3�
   1 → 2 → 3 の順番の管理や的の探索はまだ入っていない．decide_speeds() に追加する．
 
 使い方（モータが動くので，ロボットを安全な状態にしてから実行する）:
-  1. EV3で ev3_main_copy.py を起動する．
-  2. cd raspi_client && uv run python raspi_client.py
+  1. EV3で motor_sensor_server.py を起動する．
+  2. cd raspi_client && uv run python robot_controller.py
   IPアドレスが変わったときは --host <EV3のIP> で指定する．
 """
 import argparse
@@ -25,8 +25,8 @@ import time
 
 import numpy as np
 
-from camera import load_model, predict_digit, preprocess_image
-from realtime_recognition import LatestFrameReader, center_roi
+from camera import LatestFrameReader, center_roi
+from digit_recognizer import load_model, predict_digit, preprocess_image
 
 # ---- 通信 ----
 EV3_HOST = "10.42.0.175"

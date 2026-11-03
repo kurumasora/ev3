@@ -4,9 +4,9 @@
 Webカメラの動画からリアルタイムに手書き数字を認識する（EV3なしで試す用）
 
 使い方:
-  uv run python realtime_recognition.py            # 画面があればウィンドウ、なければブラウザ配信
-  uv run python realtime_recognition.py --web      # ブラウザ配信 (http://<PiのIP>:8000/)
-  uv run python realtime_recognition.py --no-gui   # 文字だけで表示
+  uv run python recognition_viewer.py            # 画面があればウィンドウ、なければブラウザ配信
+  uv run python recognition_viewer.py --web      # ブラウザ配信 (http://<PiのIP>:8000/)
+  uv run python recognition_viewer.py --no-gui   # 文字だけで表示
 
 キー（ウィンドウ表示のとき）:
   q : 終了
@@ -23,49 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
-from camera import load_model, preprocess_image, predict_digit
-
-
-class LatestFrameReader:
-    """別スレッドでカメラを読み続け、常に最新の1フレームだけを保持する
-
-    推論が撮影より遅くても、古いフレームがたまって映像が遅れることがない。
-    """
-
-    def __init__(self, camera_id, width, height):
-        self.cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        self.lock = threading.Lock()
-        self.frame = None
-        self.seq = 0
-        self.running = self.cap.isOpened()
-        if self.running:
-            self.thread = threading.Thread(target=self._loop, daemon=True)
-            self.thread.start()
-
-    def _loop(self):
-        while self.running:
-            ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
-            with self.lock:
-                self.frame = frame
-                self.seq += 1
-
-    def read(self):
-        with self.lock:
-            return self.seq, self.frame
-
-    def release(self):
-        self.running = False
-        if hasattr(self, "thread"):
-            self.thread.join(timeout=1.0)
-        self.cap.release()
+from camera import LatestFrameReader, center_roi
+from digit_recognizer import load_model, preprocess_image, predict_digit
 
 
 PAGE = b"""<!doctype html>
@@ -132,14 +91,6 @@ class MjpegServer:
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
-
-
-def center_roi(frame, roi_size):
-    h, w = frame.shape[:2]
-    s = min(roi_size, w, h)
-    x1 = (w - s) // 2
-    y1 = (h - s) // 2
-    return x1, y1, x1 + s, y1 + s
 
 
 def draw_overlay(frame, roi, resized, stable, pred, conf, fps):
