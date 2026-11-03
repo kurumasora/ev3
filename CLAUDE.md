@@ -31,7 +31,7 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 | 役割 | 画像処理・推論・判断 | ハードウェア制御のみ |
 | TCP | クライアント（EV3へ接続する） | サーバ（接続を待ち受ける） |
 | 言語 / 実行環境 | CPython 3.11以上（uvで管理） | pybricks-micropython（MicroPython） |
-| コードの場所 | `raspi/` | `ev3/` |
+| コードの場所 | `raspi_client/` | `ev3_server/` |
 | 編集場所 | ここ（Raspberry Pi） | ここ（Raspberry Pi）で書いて転送 |
 
 ### 機能の切り分け（最重要）
@@ -39,16 +39,16 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 - **推論・画像処理・判断ロジックはすべてRaspberry Pi側に書く．**
 - EV3側は「Raspberry Piから受け取った指令でモータを動かす」「センサ値を返す」だけにする．
 - EV3側のコードで numpy / tensorflow / opencv などをimportしない．EV3では動かない．
-- 両者の通信仕様（メッセージ形式）を変更するときは，`raspi/` と `ev3/` の両方を必ず同時に修正する．
+- 両者の通信仕様（メッセージ形式）を変更するときは，`raspi_client/` と `ev3_server/` の両方を必ず同時に修正する．
 
 ### 通信形式
 
 - 未確定．確定次第ここに追記する．ユーザに確認せず決めない．
 
-## Raspberry Pi側（`raspi/`）
+## Raspberry Pi側（`raspi_client/`）
 
 - 依存関係は uv で管理している（`pyproject.toml`, `uv.lock`）．
-  - 実行：`cd raspi && uv run python <ファイル名>`
+  - 実行：`cd raspi_client && uv run python <ファイル名>`
   - 追加：`uv add <パッケージ>`．`pip install` は使わない．
 - 主なファイル
   - `camera.py`：モデル読み込み・前処理・推論（`load_model`, `preprocess_image`, `predict_digit`）
@@ -57,7 +57,7 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 - 学習済みモデル `mnist_model.keras` が存在しない場合は，勝手に再学習せず，ユーザに確認する．
 - MNIST程度の学習はRaspberry Pi上で行ってよい．ただし学習の実行前にはユーザに確認する（実行中は推論・カメラ処理が重くなるため）．
 
-## EV3側（`ev3/`）
+## EV3側（`ev3_server/`）
 
 - 主なファイル
   - `ev3_main_copy.py`：TCPサーバ本体（ポート9999）
@@ -81,7 +81,7 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 - パスワードをファイルやコマンドに書かない．
 - コマンド（`2_5j/` で実行．ファイル名と時間は必要に応じて変える）：
   ```
-  scp ev3/ev3_main_copy.py robot@10.42.0.175:~/
+  scp ev3_server/ev3_main_copy.py robot@10.42.0.175:~/
   ssh -t robot@10.42.0.175 'timeout 120 brickrun -r -- pybricks-micropython ev3_main_copy.py'
   ```
 - 起動順はEV3（サーバ）が先，Raspberry Pi（クライアント）が後．
