@@ -43,7 +43,11 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 
 ### 通信形式
 
-- 未確定．確定次第ここに追記する．ユーザに確認せず決めない．
+- EV3 → Raspberry Pi：`distance_mm,gyro_angle\n`（超音波センサの距離(mm)，ジャイロの角度(度)）
+- Raspberry Pi → EV3：`left_speed,right_speed\n`（左右のモータ速度．整数，単位は度/秒）
+- EV3がセンサ値を1行送るたびに，Raspberry Piが速度指令を1行返す．
+- 指令が1秒届かないと，EV3はモータを停止する．
+- 形式を変更するときは，ユーザに確認してからここも修正する．
 
 ## Raspberry Pi側（`raspi_client/`）
 
@@ -52,7 +56,7 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
   - 追加：`uv add <パッケージ>`．`pip install` は使わない．
 - 主なファイル
   - `camera.py`：モデル読み込み・前処理・推論（`load_model`, `preprocess_image`, `predict_digit`）
-  - `raspi_server.py`：カメラ → 推論 → EV3へ指令送信．**現状はPiがサーバの旧構成であり，EV3へ接続するクライアントへの書き換えが必要．**
+  - `raspi_client.py`：TCPクライアント本体．カメラ → 推論 → EV3へ速度指令を送信．
   - `realtime_recognition.py`：EV3なしで認識だけを試すツール（`--web` でブラウザ配信）
 - 学習済みモデル `mnist_model.keras` が存在しない場合は，勝手に再学習せず，ユーザに確認する．
 - MNIST程度の学習はRaspberry Pi上で行ってよい．ただし学習の実行前にはユーザに確認する（実行中は推論・カメラ処理が重くなるため）．
