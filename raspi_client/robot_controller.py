@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raspberry Pi側のTCPクライアント．カメラ → 推論 → EV3へ速度指令を送る．
+Raspberry Pi側のTCPクライアント（本番で起動するファイル）．
+カメラ → 推論 → 判断 → EV3へ指令を送る．
 
-通信形式（CLAUDE.md の「通信形式」と同じ）:
-  EV3 → Pi : "distance_mm,gyro_angle\\n"
-  Pi → EV3 : "left_speed,right_speed\\n"（整数，単位は度/秒）
+ファイルの分担:
+  robot_controller.py : 起動，EV3との接続，通信のループ（このファイル）
+  strategy.py         : 判断（探索 → 照準 → 接近 → 発射 → 後退 → 次の数字）
+  protocol.py         : 通信形式の組み立てと解析
+  digit_recognizer.py : 画面全体から数字を探して推論する（find_digits）
+  camera.py           : カメラからのフレーム取得
 
-EV3がセンサ値を1行送るたびに，Piが速度指令を1行返す．EV3は指令が1秒届かないと
-モータを止めるので，推論が詰まっても暴走しない．
+EV3がセンサ値を1行送るたびに，Piが指令を1行返す．EV3は指令が1秒届かないと
+走行モータを止めるので，Pi側が止まっても暴走しない．
 
 スレッドの構成:
   カメラスレッド（camera.py）: 撮影を続け，最新の1フレームだけを保持する．
-  推論スレッド（DetectionWorker）: 最新のフレームを推論し続け，最新の結果だけを保持する．
-  メインスレッド（run_session）: センサ値を受け取るたびに，最新の結果から速度を決めてすぐ返す．
+  推論スレッド（DetectionWorker）: 最新のフレームから数字を探し続け，最新の結果だけを保持する．
+  メインスレッド（run_session）: センサ値を受け取るたびに，最新の結果から指令を決めてすぐ返す．
   推論の終わりを待たないので，推論が遅くなっても通信は止まらない．
-
-現在の動作:
-  的の数字（TARGET_DIGITS）が見えている間だけ前進し，見えなくなったら止まる．
-  1 → 2 → 3 の順番の管理や的の探索はまだ入っていない．decide_speeds() に追加する．
 
 使い方（モータが動くので，ロボットを安全な状態にしてから実行する）:
   1. EV3で motor_sensor_server.py を起動する．
@@ -32,8 +32,10 @@ import time
 
 import numpy as np
 
-from camera import LatestFrameReader, center_roi
-from digit_recognizer import load_model, predict_digit, preprocess_image
+from camera import LatestFrameReader
+from digit_recognizer import find_digits, load_model, predict_digit
+from protocol import format_command, parse_sensor_line, receive_latest_line
+from strategy import STOP, Strategy
 
 # ---- 通信 ----
 EV3_HOST = "10.42.0.175"
@@ -47,61 +49,11 @@ MODEL_PATH = "mnist_model.keras"
 CAMERA_ID = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-ROI_SIZE = 400            # 画面中央の認識エリアの一辺(px)
-CONF_TH = 95.0            # この確信度(%)以上のときだけ数字が見えたとみなす
-TARGET_DIGITS = {1, 2, 3}
 RESULT_TIMEOUT_S = 1.0    # 検出結果がこの時間更新されなければ，安全のため止まる（カメラや推論の停止）
 WORKER_IDLE_S = 0.005     # 新しいフレームがないとき，推論スレッドが次に確認するまで待つ時間
 
-# ---- 判断 ----
-NEED_GO_FRAMES = 3        # この回数続けて見えたら前進を始める
-NEED_STOP_FRAMES = 3      # この回数続けて見えなければ止まる
-FORWARD_SPEED = 200       # 前進するときのモータ速度(度/秒)
-
 # ---- ログ ----
 LOG_EVERY_N = 30          # 指令をこの回数送るごとに状態を表示する
-
-
-class GoStopDecider:
-    """推論のちらつきで動作が切り替わらないように，連続回数で GO / STOP を決める"""
-
-    def __init__(self):
-        self.state = "STOP"
-        self.seen = 0
-        self.not_seen = 0
-
-    def update(self, visible):
-        if visible:
-            self.seen += 1
-            self.not_seen = 0
-        else:
-            self.not_seen += 1
-            self.seen = 0
-
-        if self.state == "STOP" and self.seen >= NEED_GO_FRAMES:
-            self.state = "GO"
-        elif self.state == "GO" and self.not_seen >= NEED_STOP_FRAMES:
-            self.state = "STOP"
-
-    def reset(self):
-        self.state = "STOP"
-        self.seen = 0
-        self.not_seen = 0
-
-
-def detect_digit(model, frame):
-    """フレーム中央から数字を探し，(予測した数字, 確信度, 的が見えたか) を返す"""
-    x1, y1, x2, y2 = center_roi(frame, ROI_SIZE)
-    try:
-        input_data, resized = preprocess_image(frame[y1:y2, x1:x2])
-        # 真っ黒な画像 = 文字なし．推論すると何かの数字と誤判定するおそれがある
-        if not resized.any():
-            return None, 0.0, False
-        pred, conf = predict_digit(model, input_data)
-    except Exception as e:
-        print("[RasPi] 推論エラー:", e, flush=True)
-        return None, 0.0, False
-    return pred, conf, conf >= CONF_TH and pred in TARGET_DIGITS
 
 
 class DetectionWorker:
@@ -116,7 +68,7 @@ class DetectionWorker:
         self.model = model
         self.reader = reader
         self.lock = threading.Lock()
-        # (結果の番号, 推論を終えた時刻, 予測した数字, 確信度, 的が見えたか)．まだ結果がなければ None
+        # (結果の番号, 推論を終えた時刻, 検出結果のリスト)．まだ結果がなければ None
         self.result = None
         self.count = 0
         self.running = True
@@ -132,10 +84,14 @@ class DetectionWorker:
                 time.sleep(WORKER_IDLE_S)
                 continue
             last_seq = seq
-            pred, conf, visible = detect_digit(self.model, frame)
+            try:
+                detections = find_digits(self.model, frame)
+            except Exception as e:
+                print("[RasPi] 推論エラー:", e, flush=True)
+                detections = []
             with self.lock:
                 self.count += 1
-                self.result = (self.count, time.monotonic(), pred, conf, visible)
+                self.result = (self.count, time.monotonic(), detections)
 
     def read(self):
         with self.lock:
@@ -146,43 +102,20 @@ class DetectionWorker:
         self.thread.join(timeout=1.0)
 
 
-def decide_speeds(state, distance_mm, gyro_angle):
-    """状態とセンサ値から (左の速度, 右の速度) を決める
+class Commander:
+    """指令を送る．発射番号（fire_id）を覚えておき，発射するときだけ1増やす
 
-    distance_mm と gyro_angle はまだ使っていない．的への接近や旋回を
-    追加するときにここで使う．
+    EV3と再接続しても発射番号を引き継ぐ．EV3は接続直後に届いた番号を基準にするので，
+    再接続しただけでは撃たない．
     """
-    if state == "GO":
-        return FORWARD_SPEED, FORWARD_SPEED
-    return 0, 0
 
+    def __init__(self):
+        self.fire_id = 0
 
-def parse_sensor_line(line):
-    """ "distance_mm,gyro_angle" を (距離, 角度) にする．壊れた行なら None を返す"""
-    try:
-        distance_mm, gyro_angle = map(int, line.split(","))
-    except ValueError:
-        return None
-    return distance_mm, gyro_angle
-
-
-def receive_latest_line(conn, buffer):
-    """改行まで届いた行のうち最新の1行と，残りのバッファを返す
-
-    TCPでは行が途中で分割されて届くことがあるので，改行がない部分は
-    次回までバッファに残し，途切れた値を使わないようにする．
-    """
-    while b"\n" not in buffer:
-        data = conn.recv(1024)
-        if not data:
-            raise ConnectionError("EV3が接続を閉じました")
-        buffer += data
-    complete, _, rest = buffer.rpartition(b"\n")
-    return complete.rsplit(b"\n", 1)[-1].decode("utf-8", "replace"), rest
-
-
-def send_speeds(conn, left, right):
-    conn.sendall("{},{}\n".format(left, right).encode("utf-8"))
+    def send(self, conn, action):
+        if action.fire:
+            self.fire_id += 1
+        conn.sendall(format_command(action.left, action.right, self.fire_id))
 
 
 def connect_ev3(host, port):
@@ -201,50 +134,48 @@ def connect_ev3(host, port):
         return conn
 
 
-def run_session(conn, worker):
-    """1回の接続の間，センサ値を受け取るたびに速度指令を返す．切断時は OSError が出る
+def summarize(detections):
+    """ログ用に，検出結果を短い文字列にする"""
+    return " ".join("{}({:.0f}%,{:+.2f})".format(d.digit, d.conf, d.x_offset) for d in detections[:3]) or "なし"
+
+
+def run_session(conn, worker, strategy, commander):
+    """1回の接続の間，センサ値を受け取るたびに指令を返す．切断時は OSError が出る
 
     推論はしない．推論スレッドが置いた最新の結果を使うだけなので，すぐに指令を返せる．
     """
-    decider = GoStopDecider()
     buffer = b""
-    last_count = 0
-    pred, conf = None, 0.0
     sent_count = 0
 
     while True:
         line, buffer = receive_latest_line(conn, buffer)
-        previous_state = decider.state
-
-        # 推論スレッドの最新の結果を使う．前回と同じ結果なら，回数を加算しない
-        result = worker.read()
         now = time.monotonic()
-        if result is None or now - result[1] >= RESULT_TIMEOUT_S:
-            # カメラや推論が止まると古い判断で走り続けてしまうので止める
-            decider.reset()
-        elif result[0] != last_count:
-            last_count, _, pred, conf, visible = result
-            decider.update(visible)
+
+        # カメラや推論が止まっていたら，結果を渡さない（strategy が止まる）
+        result = worker.read()
+        if result is not None and now - result[1] >= RESULT_TIMEOUT_S:
+            result = None
 
         sensor = parse_sensor_line(line)
         if sensor is None:
             print(f"[RasPi] 壊れたセンサ値を無視します: {line!r}", flush=True)
-            left, right = 0, 0
+            action = STOP
         else:
-            left, right = decide_speeds(decider.state, *sensor)
-        send_speeds(conn, left, right)
+            action = strategy.step(now, sensor[0], sensor[1], result)
+        commander.send(conn, action)
         sent_count += 1
 
-        if decider.state != previous_state or sent_count % LOG_EVERY_N == 0:
+        if sent_count % LOG_EVERY_N == 0:
+            detections = summarize(result[2]) if result is not None else "結果なし（停止中）"
             print(
-                f"[RasPi] state={previous_state}->{decider.state} speed={left},{right} "
-                f"sensor={sensor} pred={pred} conf={conf:.1f}%",
+                f"[RasPi] 状態={strategy.state} 狙う数字={strategy.target} 指令={action.left},{action.right} "
+                f"センサ={sensor} 検出={detections}",
                 flush=True,
             )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EV3へ接続して速度指令を送るクライアント")
+    parser = argparse.ArgumentParser(description="EV3へ接続して指令を送るクライアント")
     parser.add_argument("--host", default=EV3_HOST, help="EV3のIPアドレス")
     parser.add_argument("--port", type=int, default=EV3_PORT, help="EV3のポート番号")
     args = parser.parse_args()
@@ -265,18 +196,21 @@ def main():
 
     # 接続する前から推論を始めておき，接続したらすぐ最新の結果を使えるようにする
     worker = DetectionWorker(model, reader)
+    # 再接続しても，どの数字まで撃ったかと発射番号を引き継ぐ
+    strategy = Strategy()
+    commander = Commander()
 
     try:
         while True:
             conn = connect_ev3(args.host, args.port)
             try:
-                run_session(conn, worker)
+                run_session(conn, worker, strategy, commander)
             except OSError as e:
                 print(f"[RasPi] 通信が切れました: {e}", flush=True)
             finally:
                 # 終了時や切断時に，届くならモータの停止を指令してから閉じる
                 try:
-                    send_speeds(conn, 0, 0)
+                    commander.send(conn, STOP)
                 except OSError:
                     pass
                 conn.close()
