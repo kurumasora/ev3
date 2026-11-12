@@ -10,6 +10,12 @@ Raspberry Pi側のTCPクライアント．カメラ → 推論 → EV3へ速度�
 EV3がセンサ値を1行送るたびに，Piが速度指令を1行返す．EV3は指令が1秒届かないと
 モータを止めるので，推論が詰まっても暴走しない．
 
+スレッドの構成:
+  カメラスレッド（camera.py）: 撮影を続け，最新の1フレームだけを保持する．
+  推論スレッド（DetectionWorker）: 最新のフレームを推論し続け，最新の結果だけを保持する．
+  メインスレッド（run_session）: センサ値を受け取るたびに，最新の結果から速度を決めてすぐ返す．
+  推論の終わりを待たないので，推論が遅くなっても通信は止まらない．
+
 現在の動作:
   的の数字（TARGET_DIGITS）が見えている間だけ前進し，見えなくなったら止まる．
   1 → 2 → 3 の順番の管理や的の探索はまだ入っていない．decide_speeds() に追加する．
@@ -21,6 +27,7 @@ EV3がセンサ値を1行送るたびに，Piが速度指令を1行返す．EV3�
 """
 import argparse
 import socket
+import threading
 import time
 
 import numpy as np
@@ -43,7 +50,8 @@ FRAME_HEIGHT = 480
 ROI_SIZE = 400            # 画面中央の認識エリアの一辺(px)
 CONF_TH = 95.0            # この確信度(%)以上のときだけ数字が見えたとみなす
 TARGET_DIGITS = {1, 2, 3}
-FRAME_TIMEOUT_S = 1.0     # 新しいフレームがこの時間届かなければ，安全のため止まる
+RESULT_TIMEOUT_S = 1.0    # 検出結果がこの時間更新されなければ，安全のため止まる（カメラや推論の停止）
+WORKER_IDLE_S = 0.005     # 新しいフレームがないとき，推論スレッドが次に確認するまで待つ時間
 
 # ---- 判断 ----
 NEED_GO_FRAMES = 3        # この回数続けて見えたら前進を始める
@@ -94,6 +102,48 @@ def detect_digit(model, frame):
         print("[RasPi] 推論エラー:", e, flush=True)
         return None, 0.0, False
     return pred, conf, conf >= CONF_TH and pred in TARGET_DIGITS
+
+
+class DetectionWorker:
+    """別スレッドで推論を続け，最新の検出結果だけを保持する
+
+    通信ループが推論の終わりを待たずに済むので，推論が遅くても指令をすぐ返せる．
+    結果には推論を終えた時刻を付け，カメラや推論が止まったときに古い結果で走り続けないようにする．
+    推論に時間がかかるほど，結果が表す映像はその分だけ古い点に注意する．
+    """
+
+    def __init__(self, model, reader):
+        self.model = model
+        self.reader = reader
+        self.lock = threading.Lock()
+        # (結果の番号, 推論を終えた時刻, 予測した数字, 確信度, 的が見えたか)．まだ結果がなければ None
+        self.result = None
+        self.count = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        last_seq = 0
+        while self.running:
+            seq, frame = self.reader.read()
+            # 前回と同じフレームなら推論しない
+            if frame is None or seq == last_seq:
+                time.sleep(WORKER_IDLE_S)
+                continue
+            last_seq = seq
+            pred, conf, visible = detect_digit(self.model, frame)
+            with self.lock:
+                self.count += 1
+                self.result = (self.count, time.monotonic(), pred, conf, visible)
+
+    def read(self):
+        with self.lock:
+            return self.result
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
 
 
 def decide_speeds(state, distance_mm, gyro_angle):
@@ -151,12 +201,14 @@ def connect_ev3(host, port):
         return conn
 
 
-def run_session(conn, model, reader):
-    """1回の接続の間，センサ値を受け取るたびに速度指令を返す．切断時は OSError が出る"""
+def run_session(conn, worker):
+    """1回の接続の間，センサ値を受け取るたびに速度指令を返す．切断時は OSError が出る
+
+    推論はしない．推論スレッドが置いた最新の結果を使うだけなので，すぐに指令を返せる．
+    """
     decider = GoStopDecider()
     buffer = b""
-    last_seq = 0
-    last_frame_t = time.monotonic()
+    last_count = 0
     pred, conf = None, 0.0
     sent_count = 0
 
@@ -164,17 +216,15 @@ def run_session(conn, model, reader):
         line, buffer = receive_latest_line(conn, buffer)
         previous_state = decider.state
 
-        # 最新のフレームを推論する．前回と同じフレームなら，推論も回数の加算もしない
-        seq, frame = reader.read()
+        # 推論スレッドの最新の結果を使う．前回と同じ結果なら，回数を加算しない
+        result = worker.read()
         now = time.monotonic()
-        if frame is not None and seq != last_seq:
-            last_seq = seq
-            last_frame_t = now
-            pred, conf, visible = detect_digit(model, frame)
-            decider.update(visible)
-        elif now - last_frame_t >= FRAME_TIMEOUT_S:
-            # カメラが止まると古い判断で走り続けてしまうので止める
+        if result is None or now - result[1] >= RESULT_TIMEOUT_S:
+            # カメラや推論が止まると古い判断で走り続けてしまうので止める
             decider.reset()
+        elif result[0] != last_count:
+            last_count, _, pred, conf, visible = result
+            decider.update(visible)
 
         sensor = parse_sensor_line(line)
         if sensor is None:
@@ -213,11 +263,14 @@ def main():
         reader.release()
         return
 
+    # 接続する前から推論を始めておき，接続したらすぐ最新の結果を使えるようにする
+    worker = DetectionWorker(model, reader)
+
     try:
         while True:
             conn = connect_ev3(args.host, args.port)
             try:
-                run_session(conn, model, reader)
+                run_session(conn, worker)
             except OSError as e:
                 print(f"[RasPi] 通信が切れました: {e}", flush=True)
             finally:
@@ -231,6 +284,7 @@ def main():
     except KeyboardInterrupt:
         print("[RasPi] 終了します", flush=True)
     finally:
+        worker.stop()
         reader.release()
 
 
