@@ -62,9 +62,12 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 ### 通信形式
 
 - EV3 → Raspberry Pi：`distance_mm,gyro_angle\n`（超音波センサの距離(mm)，ジャイロの角度(度)）
-- Raspberry Pi → EV3：`left_speed,right_speed\n`（左右のモータ速度．整数，単位は度/秒）
-- EV3がセンサ値を1行送るたびに，Raspberry Piが速度指令を1行返す．
-- 指令が1秒届かないと，EV3はモータを停止する．
+- Raspberry Pi → EV3：`left_speed,right_speed,fire_id\n`（左右の走行モータの速度．整数，単位は度/秒．発射番号）
+  - 発射番号が前回と変わったときだけ，EV3は1発撃つ．Raspberry Piは撃つたびに1増やす（最初は0）．
+  - 接続し直した直後に届いた発射番号は基準として覚えるだけで，撃たない．
+- EV3がセンサ値を1行送るたびに，Raspberry Piが指令を1行返す．
+- 指令が1秒届かないと，EV3は走行モータを停止する．
+- Raspberry Pi側の組み立てと解析は `raspi_client/protocol.py` にまとめる．
 - 形式を変更するときは，ユーザに確認してからここも修正する．
 
 ## Raspberry Pi側（`raspi_client/`）
@@ -73,10 +76,17 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
   - 実行：`cd raspi_client && uv run python <ファイル名>`
   - 追加：`uv add <パッケージ>`．`pip install` は使わない．
 - 主なファイル
+  - `robot_controller.py`：本番で起動するファイル．起動，EV3との接続，通信のループ．推論は別スレッド（`DetectionWorker`）で回し，通信ループは最新の検出結果だけを使う．
+  - `strategy.py`：判断．探索（その場で旋回）→ 照準 → 接近 → 発射 → 後退 → 次の数字．EV3もカメラも使わないので，作ったデータで試せる．
+  - `protocol.py`：通信形式の組み立てと解析．
+  - `digit_recognizer.py`：モデル読み込み・前処理・推論．`find_digits` は画面全体から数字の候補を探し，数字・確信度・画面上の位置を返す．
   - `camera.py`：カメラからのフレーム取得と認識エリアの計算（`LatestFrameReader`, `center_roi`）
-  - `digit_recognizer.py`：モデル読み込み・前処理・推論（`load_model`, `preprocess_image`, `predict_digit`）
-  - `robot_controller.py`：TCPクライアント本体．カメラ → 推論 → EV3へ速度指令を送信．推論は別スレッド（`DetectionWorker`）で回し，通信ループは最新の検出結果だけを使う．
-  - `recognition_viewer.py`：EV3なしで認識だけを試すツール（`--web` でブラウザ配信）
+  - `recognition_viewer.py`：EV3なしで認識だけを試すツール（`--web` でブラウザ配信）．中央の認識エリアだけを見る．
+  - `test/fire_test_client.py`：発射機構を単体で調整するためのテスト用クライアント．
+- 判断の方針（`strategy.py`）
+  - 撃つのは，狙う数字が確信度95%以上で続けて見え，正面にあり，発射距離にいるときだけ．順番外の数字には近づかない．
+  - 推論の結果は少し古いので，検出結果からは目標の向きだけを求め，実際に回る量はジャイロで測る．**ジャイロが必要．**
+  - 発射距離 `FIRE_DISTANCE_MM`，カメラの画角 `CAMERA_HFOV_DEG` などのパラメータは仮の値．実測して直す．
 - 学習済みモデル `mnist_model.keras` が存在しない場合は，勝手に再学習せず，ユーザに確認する．
 - MNIST程度の学習はRaspberry Pi上で行ってよい．ただし学習の実行前にはユーザに確認する（実行中は推論・カメラ処理が重くなるため）．
 
@@ -112,17 +122,15 @@ PC ──(Tailscale + SSH)──> Raspberry Pi ──(有線LAN / TCP)──> EV
 
 - 受信データは改行までバッファにためてから1行ずつ処理する（行が途中で分割されて届くことがあるため）．
 - 発射は `run_angle(..., wait=False)` で回し始め，完了を待たずに通信へ戻る．
-- 同じ発射の指令が複数回届いても1回だけ撃つ（発射番号が変わったときだけ撃つ案．通信形式とあわせて未確定）．
+- 同じ発射の指令が複数回届いても1回だけ撃つ（発射番号が変わったときだけ撃つ）．
 - PCなしで動かすため，EV3本体のファイルブラウザから起動できるようにする（`chmod +x`）．
 - 接続待ち・接続済み・切断をEV3の画面に表示し，接続できたらビープ音を鳴らす．
 
-### 現在のコードとの差（未対応）
+### 実機で確かめること
 
-- 走行モータが4個（A〜D）のまま．走行2個と発射1個（D）に変更する．走行モータのポートは機体に合わせて決める．
-- 切断されるとプログラムが終了する．接続待ちに戻るようにする．
-- 受信データをバッファにためずに処理している．
-- 発射の処理が入っていない．
-- `time.sleep` を使っており，コメントが英語．`wait` に変え，コメントを日本語で丁寧に書き直す．
+- 走行モータは左A・右B，発射モータはD．左右のモータを同じ向きに回したときに前進するか（逆なら `Direction` を付ける）．
+- `USE_GYRO` を `True` にしたときのジャイロの正負（時計回りで増えるか．逆なら `strategy.py` の `GYRO_SIGN` を -1 にする）．
+- `ev3_server/motor_sensor_server_01.py` は書き直す前の旧版．使わない．
 
 ### 共通のルール
 
